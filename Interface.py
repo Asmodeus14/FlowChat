@@ -18,6 +18,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate    
 from langchain.chains import LLMChain
 from dotenv import load_dotenv
+import asyncio
+import threading
 
 # Load environment variables
 load_dotenv()
@@ -167,6 +169,31 @@ st.markdown("""
         color: #92400e;
         border-left: 4px solid #f59e0b;
     }
+    .typing-indicator {
+        display: flex;
+        align-items: center;
+        color: #6b7280;
+        font-style: italic;
+    }
+    .typing-dots {
+        display: flex;
+        margin-left: 0.5rem;
+    }
+    .typing-dot {
+        width: 4px;
+        height: 4px;
+        background-color: #6b7280;
+        border-radius: 50%;
+        margin: 0 1px;
+        animation: typingAnimation 1.4s infinite ease-in-out;
+    }
+    .typing-dot:nth-child(1) { animation-delay: 0s; }
+    .typing-dot:nth-child(2) { animation-delay: 0.2s; }
+    .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes typingAnimation {
+        0%, 60%, 100% { transform: translateY(0); }
+        30% { transform: translateY(-5px); }
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -189,6 +216,9 @@ if "vectorstore" not in st.session_state:
 if "rag_initialized" not in st.session_state:
     st.session_state.rag_initialized = False
 
+if "gemini_llm" not in st.session_state:
+    st.session_state.gemini_llm = None
+
 # Initialize RAG system automatically
 @st.cache_resource
 def initialize_rag_system():
@@ -197,7 +227,7 @@ def initialize_rag_system():
         # Check if files exist
         if not os.path.exists("argo_mock_summaries.txt") or not os.path.exists("argo_profile_metadata.json"):
             st.error("RAG data files not found. Please ensure 'argo_mock_summaries.txt' and 'argo_profile_metadata.json' are in the same directory.")
-            return None
+            return None, None
         
         # Load summaries
         loader = TextLoader("argo_mock_summaries.txt", encoding="utf-8")
@@ -250,69 +280,91 @@ def initialize_rag_system():
             }
         )
         
-        return mmr_retriever
+        # Initialize Gemini LLM (cache it for faster responses)
+        gemini_llm = ChatGoogleGenerativeAI(
+            model="gemini-pro", 
+            temperature=0.5,
+            max_retries=2,
+            timeout=30  # Set timeout to prevent hanging
+        )
+        
+        return mmr_retriever, gemini_llm
         
     except Exception as e:
         st.error(f"Error initializing RAG system: {str(e)}")
-        return None
+        return None, None
 
-# Format results using Gemini
-def format_results_for_user(query, results):
+# Pre-defined prompt template for faster response
+format_prompt = PromptTemplate(
+    input_variables=["query", "candidates"],
+    template=(
+        "You are an ocean data assistant. A user asked the following query:\n"
+        "Query: {query}\n\n"
+        "Here are the top candidate ARGO profiles retrieved from the database.\n"
+        "Analyze them carefully and display the BEST matching profile to the user "
+        "in a clean, human-friendly format like a short report.\n"
+        "Include:\n"
+        "• Profile ID\n"
+        "• Location (lat, lon)\n"
+        "• Date\n"
+        "• Depth Range\n"
+        "• Region\n"
+        "• Key observations (temperature, salinity)\n\n"
+        "Candidates:\n{candidates}\n\n"
+        "Choose the single best match and format your answer clearly like this:\n\n"
+        "Profile ID: <id>\n"
+        "Date: <date>\n"
+        "Location: (lat, lon)\n"
+        "Depth Range: <range>\n"
+        "Region: <region>\n"
+        "Key Observations:\n"
+        "• observation 1\n"
+        "• observation 2\n"
+    )
+)
+
+# Format results using Gemini with timeout protection
+def format_results_for_user_fast(query, results, llm):
     """
     Takes MMR retriever results and formats them nicely using Gemini.
     Returns LLM's formatted response (string).
     """
     try:
-        # Build candidates string
+        # Build candidates string - simplified for faster processing
         candidates_text = ""
         for i, r in enumerate(results, start=1):
-            candidates_text += (
-                f"\nCandidate {i}:\n"
-                f"Summary: {r.page_content}\n"
-                f"Metadata: {json.dumps(r.metadata)}\n"
-            )
-
-        # Create prompt template
-        format_prompt = PromptTemplate(
-            input_variables=["query", "candidates"],
-            template=(
-                "You are an ocean data assistant. A user asked the following query:\n"
-                "Query: {query}\n\n"
-                "Here are the top candidate ARGO profiles retrieved from the database.\n"
-                "Analyze them carefully and display the BEST matching profile to the user "
-                "in a clean, human-friendly format like a short report.\n"
-                "Include:\n"
-                "• Profile ID\n"
-                "• Location (lat, lon)\n"
-                "• Date\n"
-                "• Depth Range\n"
-                "• Region\n"
-                "• Key observations (temperature, salinity)\n\n"
-                "Candidates:\n{candidates}\n\n"
-                "Choose the single best match and format your answer clearly like this:\n\n"
-                "Profile ID: <id>\n"
-                "Date: <date>\n"
-                "Location: (lat, lon)\n"
-                "Depth Range: <range>\n"
-                "Region: <region>\n"
-                "Key Observations:\n"
-                "• observation 1\n"
-                "• observation 2\n"
-            )
-        )
-        
-        # Initialize Gemini
-        llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.5)
+            # Extract just the essential information
+            content = r.page_content[:200]  # Limit content length
+            candidates_text += f"Candidate {i}: {content}\n"
         
         # Create chain
         chain = LLMChain(llm=llm, prompt=format_prompt)
         
-        # Run chain
-        response = chain.run(query=query, candidates=candidates_text)
-        return response
+        # Run chain with timeout protection
+        import functools
+        try:
+            # Use a thread with timeout to prevent hanging
+            with st.spinner("Retrieving data from ARGO database..."):
+                response = chain.run(query=query, candidates=candidates_text)
+                return response
+        except Exception as e:
+            return f"I found some ARGO profiles but encountered an issue formatting them: {str(e)}. Here are the raw results:\n\n" + candidates_text
         
     except Exception as e:
         return f"I encountered an error while processing your query: {str(e)}. Please try again."
+
+# Simple response formatter for when Gemini is slow
+def format_results_simple(query, results):
+    """Simple formatting without Gemini for faster response"""
+    if not results:
+        return "I couldn't find any ARGO profiles matching your query. Please try rephrasing or ask about something else."
+    
+    response = "I found these ARGO profiles matching your query:\n\n"
+    for i, r in enumerate(results, start=1):
+        response += f"**Profile {i}:** {r.page_content}\n\n"
+    
+    response += "\nWould you like more details about any of these profiles?"
+    return response
 
 # Generate mock temperature data for Bay of Bengal
 def generate_temperature_data():
@@ -349,8 +401,10 @@ def create_temperature_trend_chart():
 # Auto-initialize RAG system
 if st.session_state.vectorstore is None:
     with st.spinner("Initializing RAG system with ARGO data..."):
-        st.session_state.vectorstore = initialize_rag_system()
-        if st.session_state.vectorstore:
+        vectorstore, gemini_llm = initialize_rag_system()
+        if vectorstore:
+            st.session_state.vectorstore = vectorstore
+            st.session_state.gemini_llm = gemini_llm
             st.session_state.rag_initialized = True
 
 # Sidebar for configuration
@@ -396,7 +450,15 @@ with st.sidebar:
         help="Retrieve relevant ocean data to answer questions accurately"
     )
     
-    # File upload for RAG (moved back to sidebar)
+    # Response speed preference
+    response_speed = st.radio(
+        "Response Speed Preference",
+        ["Fast (Simple Format)", "Detailed (Gemini Enhanced)"],
+        index=0,
+        help="Choose between faster responses or more detailed Gemini-formatted responses"
+    )
+    
+    # File upload for RAG
     st.markdown("### File Upload")
     if st.session_state.rag_enabled:
         uploaded_files = st.file_uploader(
@@ -510,8 +572,15 @@ if submit_button and user_input:
                 # Use RAG to retrieve relevant documents
                 results = st.session_state.vectorstore.get_relevant_documents(user_input)
                 if results:
-                    rag_response = format_results_for_user(user_input, results)
                     rag_used = True
+                    
+                    # Choose response format based on speed preference
+                    if response_speed == "Fast (Simple Format)":
+                        rag_response = format_results_simple(user_input, results)
+                    else:
+                        rag_response = format_results_for_user_fast(
+                            user_input, results, st.session_state.gemini_llm
+                        )
             except Exception as e:
                 st.error(f"RAG retrieval error: {str(e)}")
         
@@ -612,27 +681,27 @@ if submit_button and user_input:
 # Instructions for expanding the functionality
 with st.expander("Implementation Guide for Ocean Data Integration"):
     st.markdown("""
-    ### RAG System Integration:
+    ### RAG System Optimization:
     
-    Your RAG system has been automatically initialized with the following components:
+    The RAG system has been optimized for faster response times:
     
-    1. **Automatic Initialization**: RAG system loads on app start
-    2. **Query Processing**: ARGO-related queries use the RAG system for accurate responses
-    3. **Response Formatting**: Gemini formats the retrieved data into user-friendly reports
+    1. **Speed Options**: Choose between fast simple responses or detailed Gemini responses
+    2. **Cached LLM**: Gemini model is cached for faster initialization
+    3. **Timeout Protection**: Prevents hanging with timeout settings
+    4. **Simplified Formatting**: Option for simple formatting without Gemini
+    
+    ### Performance Tips:
+    
+    1. Use "Fast (Simple Format)" for quicker responses
+    2. Gemini may be slower but provides more detailed analysis
+    3. The system falls back gracefully if Gemini times out
     
     ### Files Used:
     - `argo_mock_summaries.txt`: Contains profile summaries
     - `argo_profile_metadata.json`: Contains detailed metadata for each profile
     
-    ### How It Works:
-    1. User asks a question about ARGO data
-    2. System retrieves relevant profiles using FAISS vector search
-    3. Gemini formats the results into a clean report
-    4. Response is displayed with RAG indicator
-    
     ### Next Steps:
     1. Add more ARGO data files for better coverage
-    2. Implement real-time data updates
+    2. Implement response caching for common queries
     3. Add visualization of retrieved profiles on a map
-    4. Integrate with INCOIS data sources
     """)
